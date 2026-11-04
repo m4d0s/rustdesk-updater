@@ -1,0 +1,535 @@
+#!/bin/sh
+
+API="https://api.github.com/repos/rustdesk/rustdesk-server/releases/latest"
+ASSET="rustdesk-server-linux-arm64v8.zip"
+
+ROOT="/opt/rustdesk-updater"
+BACKUPS="$ROOT/backups"
+WORK="/tmp/rustdesk-updater"
+STATE="$ROOT/last-check.json"
+LOG="$ROOT/updater$(date +%Y%m%d).log"
+
+mkdir -p "$ROOT" "$BACKUPS" "$WORK" || exit 1
+
+exec 9>/tmp/rustdesk-updater.lock
+flock -n 9 || {
+	echo "Обновление или откат уже выполняется"
+	exit 1
+}
+
+CURRENT=""
+RELAY=""
+VERSION=""
+EXPECTED=""
+URL=""
+
+log() {
+	echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG"
+	echo "$*"
+}
+
+get_version() {
+	"$1" --version 2>&1 | awk 'NR == 1 { print $2 }'
+}
+
+valid_version() {
+	echo "$1" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'
+}
+
+version_greater() {
+	awk -F. -v a="$1" -v b="$2" '
+	BEGIN {
+		split(a, x, ".")
+		split(b, y, ".")
+		for (i=1; i<=3; i++) {
+			if ((x[i]+0) > (y[i]+0)) exit 0
+			if ((x[i]+0) < (y[i]+0)) exit 1
+		}
+		exit 1
+	}'
+}
+
+write_state() {
+	STATUS="$1"
+	MESSAGE="$2"
+
+	jq -n \
+		--arg time "$(date '+%Y-%m-%d %H:%M:%S')" \
+		--arg hbbs "$CURRENT" \
+		--arg hbbr "$RELAY" \
+		--arg latest "$VERSION" \
+		--arg sha256 "$EXPECTED" \
+		--arg status "$STATUS" \
+		--arg message "$MESSAGE" \
+		'{
+			checked_at: $time,
+			hbbs_version: $hbbs,
+			hbbr_version: $hbbr,
+			latest_version: $latest,
+			sha256: $sha256,
+			status: $status,
+			message: $message
+		}' > "$STATE.tmp" &&
+		mv -f "$STATE.tmp" "$STATE"
+}
+
+fail() {
+	log "ОШИБКА: $*"
+	write_state "error" "$*" || log "Не удалось записать состояние"
+	return 1
+}
+
+read_installed_versions() {
+	CURRENT="$(get_version /usr/bin/hbbs)"
+	RELAY="$(get_version /usr/bin/hbbr)"
+
+	if ! valid_version "$CURRENT" || ! valid_version "$RELAY"; then
+		fail "Не удалось определить версии hbbs/hbbr"
+		return 1
+	fi
+
+	if [ "$CURRENT" != "$RELAY" ]; then
+		fail "Версии hbbs и hbbr различаются"
+		return 1
+	fi
+}
+
+check_release() {
+	curl -fsSL --connect-timeout 15 --max-time 60 \
+		-H 'Accept: application/vnd.github+json' \
+		"$API" -o "$WORK/release.json" || {
+			fail "GitHub API недоступен"
+			return 1
+		}
+
+	VERSION="$(jq -r '.tag_name // empty' "$WORK/release.json")"
+	DIGEST="$(jq -r \
+		--arg name "$ASSET" \
+		'.assets[] | select(.name == $name) | .digest // empty' \
+		"$WORK/release.json")"
+	URL="$(jq -r \
+		--arg name "$ASSET" \
+		'.assets[] | select(.name == $name) | .browser_download_url // empty' \
+		"$WORK/release.json")"
+
+	VERSION="${VERSION#v}"
+
+	if ! valid_version "$VERSION"; then
+		fail "GitHub вернул неверный номер версии"
+		return 1
+	fi
+
+	if ! echo "$DIGEST" | grep -Eq '^sha256:[a-f0-9]{64}$'; then
+		fail "SHA256 отсутствует или имеет неверный формат"
+		return 1
+	fi
+
+	case "$URL" in
+		https://github.com/rustdesk/rustdesk-server/releases/download/*/"$ASSET") ;;
+		*)
+			fail "Недопустимая ссылка на архив"
+			return 1
+			;;
+	esac
+
+	EXPECTED="${DIGEST#sha256:}"
+	return 0
+}
+
+verify_backup_hashes() {
+	local VERIFY_DIR="$1"
+	local EXPECTED_HBBS EXPECTED_HBBR ACTUAL_HBBS ACTUAL_HBBR
+
+	[ -s "$VERIFY_DIR/hbbs" ] &&
+	[ -s "$VERIFY_DIR/hbbr" ] &&
+	[ -s "$VERIFY_DIR/hbbs.sha256" ] &&
+	[ -s "$VERIFY_DIR/hbbr.sha256" ] || return 1
+
+	EXPECTED_HBBS="$(cat "$VERIFY_DIR/hbbs.sha256")" || return 1
+	EXPECTED_HBBR="$(cat "$VERIFY_DIR/hbbr.sha256")" || return 1
+
+	[ "${#EXPECTED_HBBS}" -eq 64 ] || return 1
+	[ "${#EXPECTED_HBBR}" -eq 64 ] || return 1
+
+	case "$EXPECTED_HBBS$EXPECTED_HBBR" in
+		*[!0-9a-f]*) return 1 ;;
+	esac
+
+	ACTUAL_HBBS="$(sha256sum "$VERIFY_DIR/hbbs")" || return 1
+	ACTUAL_HBBR="$(sha256sum "$VERIFY_DIR/hbbr")" || return 1
+
+	ACTUAL_HBBS="${ACTUAL_HBBS%% *}"
+	ACTUAL_HBBR="${ACTUAL_HBBR%% *}"
+
+	[ "$ACTUAL_HBBS" = "$EXPECTED_HBBS" ] &&
+	[ "$ACTUAL_HBBR" = "$EXPECTED_HBBR" ]
+}
+
+save_current_backup() {
+	read_installed_versions || return 1
+
+	DIR="$BACKUPS/$CURRENT"
+
+	if [ -s "$DIR/hbbs" ] &&
+	   [ -s "$DIR/hbbr" ] &&
+	   [ "$(cat "$DIR/version" 2>/dev/null)" = "$CURRENT" ] &&
+	   verify_backup_hashes "$DIR" &&
+	   verify_pair "$DIR/hbbs" "$DIR/hbbr" "$CURRENT"; then
+		log "Проверенная резервная копия $CURRENT уже существует"
+		return 0
+	fi
+
+	TMP="$BACKUPS/.${CURRENT}.$$"
+	rm -rf "$TMP"
+	mkdir -p "$TMP" || return 1
+
+	if ! cp -p /usr/bin/hbbs "$TMP/hbbs" ||
+	   ! cp -p /usr/bin/hbbr "$TMP/hbbr"; then
+		rm -rf "$TMP"
+		fail "Не удалось скопировать текущие бинарники"
+		return 1
+	fi
+
+	chmod 755 "$TMP/hbbs" "$TMP/hbbr" || {
+		rm -rf "$TMP"
+		return 1
+	}
+
+	H1="$(sha256sum "$TMP/hbbs" | awk '{print $1}')"
+	H2="$(sha256sum "$TMP/hbbr" | awk '{print $1}')"
+
+	printf '%s\n' "$CURRENT" > "$TMP/version" || return 1
+	printf '%s\n' "$H1" > "$TMP/hbbs.sha256" || return 1
+	printf '%s\n' "$H2" > "$TMP/hbbr.sha256" || return 1
+
+	if [ -d "$DIR" ]; then
+		rm -rf "$DIR" || {
+			rm -rf "$TMP"
+			return 1
+		}
+	fi
+
+	mv "$TMP" "$DIR" || {
+		rm -rf "$TMP"
+		return 1
+	}
+
+	log "Создана резервная копия $CURRENT"
+	return 0
+}
+
+prune_backups() {
+	COUNT=0
+
+	for DIR in $(ls -1dt "$BACKUPS"/*/ 2>/dev/null); do
+		[ -d "$DIR" ] || continue
+		COUNT=$((COUNT + 1))
+
+		if [ "$COUNT" -gt 3 ]; then
+			log "Удаление старой резервной копии ${DIR%/}"
+			rm -rf "$DIR"
+		fi
+	done
+}
+
+verify_pair() {
+	[ -s "$1" ] && [ -s "$2" ] || return 1
+
+	[ "$(get_version "$1")" = "$3" ] &&
+	[ "$(get_version "$2")" = "$3" ]
+}
+
+# Install a pair of binaries and always attempt to restore/start
+# the previous service if installation or startup fails.
+deploy_pair() {
+	SOURCE_HBBS="$1"
+	SOURCE_HBBR="$2"
+	TARGET_VERSION="$3"
+
+	if ! verify_pair "$SOURCE_HBBS" "$SOURCE_HBBR" "$TARGET_VERSION"; then
+		fail "Проверка исходных бинарников не пройдена"
+		return 1
+	fi
+
+	STAGE="/tmp/rustdesk-deploy.$$"
+	mkdir -p "$STAGE" || return 1
+
+	cp -p "$SOURCE_HBBS" "$STAGE/hbbs.new" &&
+	cp -p "$SOURCE_HBBR" "$STAGE/hbbr.new" || {
+		rm -rf "$STAGE"
+		fail "Не удалось подготовить новые файлы"
+		return 1
+	}
+
+	chmod 755 "$STAGE/hbbs.new" "$STAGE/hbbr.new" || {
+		rm -rf "$STAGE"
+		return 1
+	}
+
+	cp -p /usr/bin/hbbs "$STAGE/hbbs.old" &&
+	cp -p /usr/bin/hbbr "$STAGE/hbbr.old" || {
+		rm -rf "$STAGE"
+		fail "Не удалось сохранить текущие бинарники перед установкой"
+		return 1
+	}
+
+	if ! /etc/init.d/rustdesk-server stop; then
+		/etc/init.d/rustdesk-server start >/dev/null 2>&1
+		rm -rf "$STAGE"
+		fail "Не удалось остановить RustDesk Server"
+		return 1
+	fi
+
+	INSTALL_OK=1
+
+	mv -f "$STAGE/hbbs.new" /usr/bin/hbbs || INSTALL_OK=0
+	if [ "$INSTALL_OK" = "1" ]; then
+		mv -f "$STAGE/hbbr.new" /usr/bin/hbbr || INSTALL_OK=0
+	fi
+
+	if [ "$INSTALL_OK" = "1" ]; then
+		verify_pair /usr/bin/hbbs /usr/bin/hbbr "$TARGET_VERSION" || INSTALL_OK=0
+	fi
+
+	if [ "$INSTALL_OK" = "1" ]; then
+		/etc/init.d/rustdesk-server start || INSTALL_OK=0
+	fi
+
+	if [ "$INSTALL_OK" = "1" ]; then
+		sleep 5
+		pidof hbbs >/dev/null && pidof hbbr >/dev/null || INSTALL_OK=0
+	fi
+
+	if [ "$INSTALL_OK" = "1" ]; then
+		rm -rf "$STAGE"
+		log "Установлена версия $TARGET_VERSION"
+		return 0
+	fi
+
+	log "Установка не прошла. Восстанавливаю прежние бинарники"
+
+	RESTORE_OK=1
+	cp -p "$STAGE/hbbs.old" /usr/bin/hbbs.restore &&
+		cp -p "$STAGE/hbbr.old" /usr/bin/hbbr.restore || RESTORE_OK=0
+
+	if [ "$RESTORE_OK" = "1" ]; then
+		chmod 755 /usr/bin/hbbs.restore /usr/bin/hbbr.restore || RESTORE_OK=0
+	fi
+
+	if [ "$RESTORE_OK" = "1" ]; then
+		mv -f /usr/bin/hbbs.restore /usr/bin/hbbs &&
+			mv -f /usr/bin/hbbr.restore /usr/bin/hbbr || RESTORE_OK=0
+	fi
+
+	/etc/init.d/rustdesk-server start || RESTORE_OK=0
+	sleep 5
+
+	if pidof hbbs >/dev/null && pidof hbbr >/dev/null; then
+		log "Прежняя версия восстановлена, процессы работают"
+	else
+		RESTORE_OK=0
+		log "КРИТИЧЕСКАЯ ОШИБКА: процессы RustDesk не запущены"
+	fi
+
+	rm -rf "$STAGE"
+
+	if [ "$RESTORE_OK" = "1" ]; then
+		fail "Установка не удалась; прежняя версия восстановлена"
+	else
+		fail "Установка и восстановление завершились с ошибкой; требуется проверка службы"
+	fi
+
+	return 1
+}
+
+do_check() {
+	check_release || return 1
+	read_installed_versions || return 1
+
+	log "Установленная версия: $CURRENT"
+	log "Последняя версия GitHub: $VERSION"
+	log "SHA256: $EXPECTED"
+
+	if [ "$CURRENT" = "$VERSION" ]; then
+		write_state "up_to_date" "Установлена последняя версия"
+		log "Обновление не требуется"
+		return 0
+	fi
+
+	if version_greater "$VERSION" "$CURRENT"; then
+		write_state "update_available" "Доступно новое обновление"
+		log "Доступно обновление до $VERSION"
+		return 0
+	fi
+
+	fail "На GitHub обнаружена более старая версия; обновление запрещено"
+}
+
+do_update() {
+	check_release || return 1
+	install_release
+}
+
+install_release() {
+	read_installed_versions || return 1
+
+	if [ "$CURRENT" = "$VERSION" ]; then
+		write_state "up_to_date" "Установлена последняя версия"
+		log "Обновление не требуется"
+		return 0
+	fi
+
+	if ! version_greater "$VERSION" "$CURRENT"; then
+		fail "Установка старой версии запрещена"
+		return 1
+	fi
+
+	write_state "updating" "Загрузка версии $VERSION"
+	log "Загрузка версии $VERSION"
+
+	curl -fL --retry 3 --connect-timeout 15 --max-time 300 \
+		"$URL" -o "$WORK/$ASSET" || {
+			fail "Не удалось загрузить архив"
+			return 1
+		}
+
+	ACTUAL="$(sha256sum "$WORK/$ASSET" | awk '{print $1}')"
+
+	if [ "$ACTUAL" != "$EXPECTED" ]; then
+		fail "SHA256 архива не совпадает. Установка отменена"
+		return 1
+	fi
+
+	log "SHA256 совпадает"
+
+	unzip -p "$WORK/$ASSET" arm64v8/hbbs > "$WORK/hbbs" || {
+		fail "Не удалось извлечь hbbs"
+		return 1
+	}
+
+	unzip -p "$WORK/$ASSET" arm64v8/hbbr > "$WORK/hbbr" || {
+		fail "Не удалось извлечь hbbr"
+		return 1
+	}
+
+	chmod 755 "$WORK/hbbs" "$WORK/hbbr" || return 1
+
+	if ! verify_pair "$WORK/hbbs" "$WORK/hbbr" "$VERSION"; then
+		fail "Версии бинарников в архиве не совпадают с релизом"
+		return 1
+	fi
+
+	save_current_backup || return 1
+
+	if ! deploy_pair "$WORK/hbbs" "$WORK/hbbr" "$VERSION"; then
+		return 1
+	fi
+
+	write_state "updated" "Обновление до $VERSION выполнено успешно"
+	prune_backups
+	return 0
+}
+
+do_auto() {
+	ENABLED="$(uci -q get rustdesk-updater.main.enabled)"
+	AUTO="$(uci -q get rustdesk-updater.main.auto_update)"
+
+	[ "${ENABLED:-1}" = "1" ] || {
+		log "Автоматическая работа отключена"
+		return 0
+	}
+
+	[ "${AUTO:-1}" = "1" ] || {
+		log "Автоматическая установка отключена"
+		return 0
+	}
+
+	# One GitHub request: reuse this release data for installation.
+	check_release || return 1
+	read_installed_versions || return 1
+
+	if [ "$CURRENT" = "$VERSION" ]; then
+		write_state "up_to_date" "Установлена последняя версия"
+		log "Автоматическое обновление не требуется"
+		return 0
+	fi
+
+	if ! version_greater "$VERSION" "$CURRENT"; then
+		fail "Автоматическая установка старой версии запрещена"
+		return 1
+	fi
+
+	install_release
+}
+
+do_rollback() {
+	TARGET="$1"
+
+	if ! valid_version "$TARGET"; then
+		fail "Некорректный номер версии для отката"
+		return 1
+	fi
+
+	DIR="$BACKUPS/$TARGET"
+
+	if [ ! -s "$DIR/hbbs" ] || [ ! -s "$DIR/hbbr" ] ||
+	   [ "$(cat "$DIR/version" 2>/dev/null)" != "$TARGET" ]; then
+		fail "Резервная копия версии $TARGET не найдена или повреждена"
+		return 1
+	fi
+
+	if ! verify_backup_hashes "$DIR"; then
+		fail "SHA256 резервной копии $TARGET не совпадает или отсутствует"
+		return 1
+	fi
+
+	if ! verify_pair "$DIR/hbbs" "$DIR/hbbr" "$TARGET"; then
+		fail "Проверка версии резервной копии не пройдена"
+		return 1
+	fi
+
+	read_installed_versions || return 1
+
+	if [ "$CURRENT" = "$TARGET" ]; then
+		write_state "up_to_date" "Эта версия уже установлена"
+		log "Версия $TARGET уже установлена"
+		return 0
+	fi
+
+	save_current_backup || return 1
+
+	write_state "rolling_back" "Откат на версию $TARGET"
+	log "Начинаю откат на $TARGET"
+
+	if ! deploy_pair "$DIR/hbbs" "$DIR/hbbr" "$TARGET"; then
+		return 1
+	fi
+
+	write_state "rolled_back" "Откат на версию $TARGET выполнен успешно"
+	prune_backups
+	return 0
+}
+
+case "$1" in
+	check)
+		do_check
+		;;
+	update)
+		do_update
+		;;
+	auto)
+		do_auto
+		;;
+	rollback)
+		if [ -n "$2" ]; then
+			do_rollback "$2"
+		else
+			echo "Укажи версию для отката"
+			exit 2
+		fi
+		;;
+	*)
+		echo "Использование: $0 {check|update|auto|rollback X.Y.Z}"
+		exit 2
+		;;
+esac

@@ -1,0 +1,15 @@
+{
+	"admin/services/rustdesk-server/updater": {
+		"title": "RustDesk Updater",
+		"order": 30,
+		"action": {
+			"type": "view",
+			"path": "rustdesk-updater/general"
+		},
+		"depends": {
+			"acl": [
+				"luci-app-rustdesk-updater"
+			]
+		}
+	}
+}

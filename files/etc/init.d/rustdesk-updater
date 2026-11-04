@@ -1,0 +1,20 @@
+#!/bin/sh /etc/rc.common
+
+START=95
+STOP=10
+
+start() {
+	/usr/libexec/rustdesk-updater-schedule
+}
+
+reload() {
+	/usr/libexec/rustdesk-updater-schedule
+}
+
+restart() {
+	/usr/libexec/rustdesk-updater-schedule
+}
+
+stop() {
+	return 0
+}

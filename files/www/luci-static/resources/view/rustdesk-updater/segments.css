@@ -1,0 +1,97 @@
+.rdu-grid {
+	display: grid;
+	grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+	gap: 12px;
+	margin-bottom: 16px;
+}
+
+.rdu-card {
+	padding: 14px;
+	border: 1px solid var(--border-color-medium);
+	border-radius: 6px;
+	margin-bottom: 12px;
+	min-width: 0;
+}
+
+.rdu-card h3 {
+	margin: 0 0 12px;
+}
+
+.rdu-status-row {
+	display: flex;
+	justify-content: space-between;
+	gap: 12px;
+	padding: 7px 0;
+	border-bottom: 1px solid var(--border-color-low);
+}
+
+.rdu-status-row:last-child {
+	border-bottom: 0;
+}
+
+.rdu-label {
+	color: var(--text-color-secondary);
+}
+
+.rdu-message {
+	margin-top: 12px;
+	overflow-wrap: anywhere;
+}
+
+.rdu-actions {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 8px;
+	margin: 14px 0;
+}
+
+.rdu-backup-table {
+	width: 100%;
+	table-layout: fixed;
+}
+
+.rdu-hash {
+	overflow-wrap: anywhere;
+	word-break: break-all;
+	font-family: monospace;
+	font-size: 0.85em;
+}
+
+.rdu-date-list {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 7px;
+	margin-bottom: 14px;
+}
+
+.rdu-log-output {
+	display: block;
+	box-sizing: border-box;
+	width: 100%;
+	max-height: 560px;
+	min-height: 180px;
+	padding: 12px;
+	overflow: auto;
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
+	border: 1px solid var(--border-color-medium);
+	border-radius: 5px;
+	background: var(--background-color-low);
+	font-family: monospace;
+	font-size: 12px;
+}
+
+.rdu-muted {
+	color: var(--text-color-secondary);
+}
+
+@media screen and (max-width: 600px) {
+	.rdu-status-row {
+		flex-direction: column;
+		gap: 3px;
+	}
+
+	.rdu-backup-table {
+		font-size: 11px;
+	}
+}

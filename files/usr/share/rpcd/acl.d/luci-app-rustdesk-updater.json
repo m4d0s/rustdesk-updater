@@ -1,0 +1,29 @@
+{
+    "luci-app-rustdesk-updater": {
+        "description": "RustDesk Updater management",
+        "read": {
+            "uci": [
+                "rustdesk-updater"
+            ],
+            "ubus": {
+                "luci.rustdesk-updater": [
+                    "get_status",
+                    "get_log",
+                    "get_backups",
+                    "get_backups_details"
+                ]
+            }
+        },
+        "write": {
+            "uci": [
+                "rustdesk-updater"
+            ],
+            "ubus": {
+                "luci.rustdesk-updater": [
+                    "run_action",
+                    "rollback_version"
+                ]
+            }
+        }
+    }
+}
