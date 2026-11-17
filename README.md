@@ -9,3 +9,18 @@
 
 ### AI Generated
 Создано с помощью ChatGPT, проверено человеком
+
+## Сборка вручную / OpenWrt SDK
+
+Для самостоятельной сборки пакета `luci-app-rustdesk-updater` под OpenWrt 25.x
+требуется исходный код OpenWrt 25.x либо **OpenWrt SDK** (`openwrt-sdk-*` для
+целевой архитектуры) — дополнительные файлы SDK при необходимости готовятся
+отдельно и не входят в репозиторий.
+
+Сборка:
+
+```sh
+make package/luci-app-rustdesk-updater/compile
+```
+
+или `make package/luci-app-rustdesk-updater/openwrt`.
